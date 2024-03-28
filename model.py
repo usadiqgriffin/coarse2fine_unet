@@ -9,11 +9,9 @@ import random
 import time
 import nibabel as nib
 import scipy.misc
-import utils.stn3d as stn3d
 from tqdm import tqdm
 from datetime import datetime
 import glob
-from tensorflow.python.tools import freeze_graph
 import logging
 from tensorflow.keras.layers import UpSampling3D, AveragePooling3D
 
@@ -22,27 +20,16 @@ def tensor_print(x, text):
 class Model(object):
 
 
-    def fix_border_issue(self, image):
-
-        min_val = tf.reduce_min(image)
-
-        fixed_image = tf.pad(image[:, 1:-1, 1:-1, 1:-1, :], 
-                             tf.constant([[0, 0], [1, 1], [1, 1], [1, 1], [0, 0]]),
-                             mode='CONSTANT', 
-                             constant_values=min_val)
-        return fixed_image
-
-    
     def deep_dice_bce_loss(self, true, pred, deep_pred, smooth=1e-5):
         
-        label_n = 0
+        label_0 = 0
         def dice_loss(true, pred):
             true = tf.cast(true, tf.float32)
             pred = tf.cast(pred, tf.float32)
             #logging.debug(f"True shape:{true.shape}, pred shape:{pred.shape}")
-            numerator = tf.reduce_sum(true * pred, axis=[1, 2, 3]) + smooth
-            denominator = tf.reduce_sum(true, axis=[1, 2, 3]) + tf.reduce_sum(pred, axis=[1, 2, 3]) + smooth
-            loss = -(numerator / denominator)
+            num = tf.reduce_sum(true * pred, axis=[1, 2, 3]) + smooth
+            den = tf.reduce_sum(true, axis=[1, 2, 3]) + tf.reduce_sum(pred, axis=[1, 2, 3]) + smooth
+            loss = -(num / den)
             return loss
 
         def call(true, pred):
@@ -50,8 +37,8 @@ class Model(object):
             logging.debug(f"True shape:{true.shape}, pred shape:{pred.shape}, deep pred shape:{len(deep_pred)}")
             logging.debug(f"Deep pred shapes:({deep_pred[0].shape}), ({deep_pred[1].shape}), ({deep_pred[2].shape})")
 
-            true = tf.cast(tf.equal(true, label_n * tf.ones_like(true)), tf.float32)
-            pred = tf.cast(pred[..., label_n], tf.float32)
+            true = tf.cast(tf.equal(true, label_0 * tf.ones_like(true)), tf.float32)
+            pred = tf.cast(pred[..., label_0], tf.float32)
             
             foreground_dice_loss = dice_loss(true, pred)
             background_dice_loss = dice_loss(1 - true, 1 - pred)
@@ -61,22 +48,21 @@ class Model(object):
             return loss
             
         return call(true, pred)
-
     
-    def dice_bce_loss(true, pred, label_n, smooth=1e-5):
+    def dice_bce_loss(true, pred, label_0, smooth=1e-7):
         
         def dice_loss(true, pred):
             true = tf.cast(true, tf.float32)
             pred = tf.cast(pred, tf.float32)
-            numerator = tf.reduce_sum(true * pred, axis=[1, 2, 3]) + smooth
-            denominator = tf.reduce_sum(true, axis=[1, 2, 3]) + tf.reduce_sum(pred, axis=[1, 2, 3]) + smooth
-            loss = -(numerator / denominator)
+            num = tf.reduce_sum(true * pred, axis=[1, 2, 3]) + smooth
+            den = tf.reduce_sum(true, axis=[1, 2, 3]) + tf.reduce_sum(pred, axis=[1, 2, 3]) + smooth
+            loss = -(num / den)
             return loss
 
         def call(true, pred):
             
-            true = tf.cast(tf.equal(true, label_n * tf.ones_like(true)), tf.float32)
-            pred = tf.cast(pred[..., label_n], tf.float32)
+            true = tf.cast(tf.equal(true, label_0 * tf.ones_like(true)), tf.float32)
+            pred = tf.cast(pred[..., label_0], tf.float32)
             
             foreground_dice_loss = dice_loss(true, pred)
             background_dice_loss = dice_loss(1 - true, 1 - pred)
@@ -86,8 +72,7 @@ class Model(object):
             return loss
             
         return call(true, pred)
-    
-    
+        
     def __init__(self, output_path, clean_output, create_summary, gpu):
 
         self.output_path = output_path
@@ -111,46 +96,6 @@ class Model(object):
             self.summary_writer_train = tf.summary.FileWriter(output_path + '/tensorboard/train', graph=self.sess.graph)
             self.summary_writer_val = tf.summary.FileWriter(output_path + '/tensorboard/val', graph=self.sess.graph)
 
-
-    def classifier(self, input):
-
-        down1 = tf.layers.conv3d(input, 8, (3, 3, 3), (1, 1, 1), 'same', activation=tf.nn.relu)  # [batch, 80, 192, 160]
-        down1 = tf.layers.conv3d(down1, 8, (3, 3, 3), (1, 1, 1), 'same', activation=tf.nn.relu)
-        down1 = tf.layers.batch_normalization(down1, training=self.training)
-
-        down2 = tf.layers.conv3d(down1, 8, (3, 3, 3), (2, 2, 2), 'same', activation=tf.nn.relu)  # [40, 96, 80]
-        down2 = tf.layers.conv3d(down2, 8, (3, 3, 3), (1, 1, 1), 'same', activation=tf.nn.relu)
-        down2 = tf.layers.batch_normalization(down2, training=self.training)
-
-        down3 = tf.layers.conv3d(down2, 16, (3, 3, 3), (2, 2, 2), 'same', activation=tf.nn.relu)  # [20, 48, 40]
-        down3 = tf.layers.conv3d(down3, 16, (3, 3, 3), (1, 1, 1), 'same', activation=tf.nn.relu)
-        down3 = tf.layers.batch_normalization(down3, training=self.training)
-
-        down4 = tf.layers.conv3d(down3, 16, (3, 3, 3), (2, 2, 2), 'same', activation=tf.nn.relu)  # [10, 24, 20]
-        down4 = tf.layers.conv3d(down4, 16, (3, 3, 3), (1, 1, 1), 'same', activation=tf.nn.relu)
-        down4 = tf.layers.batch_normalization(down4, training=self.training)
-
-        down5 = tf.layers.conv3d(down4, 32, (3, 3, 3), (2, 2, 2), 'same', activation=tf.nn.relu)  # [5, 12, 10]
-        down5 = tf.layers.conv3d(down5, 32, (3, 3, 3), (1, 1, 1), 'same', activation=tf.nn.relu)
-        down5 = tf.layers.batch_normalization(down5, training=self.training)
-
-        down6 = tf.layers.conv3d(down5, 32, (3, 3, 3), (2, 2, 2), 'same', activation=tf.nn.relu)  # [3, 6, 5]
-        down6 = tf.layers.conv3d(down6, 32, (3, 3, 3), (1, 1, 1), 'same', activation=tf.nn.relu)
-        down6 = tf.layers.batch_normalization(down6, training=self.training)
-
-        down7 = tf.layers.conv3d(down6, 64, (3, 3, 3), (1, 2, 2), 'same', activation=tf.nn.relu)  # [3, 3, 3]
-        down7 = tf.layers.conv3d(down7, 64, (3, 3, 3), (1, 1, 1), 'same', activation=tf.nn.relu)
-        down7 = tf.layers.batch_normalization(down7, training=self.training)
-
-        latent = tf.layers.conv3d(down7, 64, (3, 3, 3), (1, 1, 1), 'valid', activation=tf.nn.relu)  # [1, 1, 1]
-        latent = tf.layers.conv3d(latent, 64, (1, 1, 1), (1, 1, 1), 'valid', activation=tf.nn.relu)
-        latent = tf.layers.batch_normalization(latent, training=self.training)
-
-        latent_flat = tf.reshape(latent, [self.batch, 64])  # [batch, 64]
-
-        return latent_flat
-
-
     def initialize_weights(self, global_step):
 
         self.saver = tf.train.Saver(max_to_keep=None)
@@ -167,119 +112,18 @@ class Model(object):
                 epoch_list = sorted(epoch_list)
                 global_step = epoch_list[-1]
 
-            print('\n********************************')
-            print('Loading model-' + str(global_step))
-            print('********************************\n')
             self.saver.restore(self.sess, self.output_path + '/models/model-' + str(global_step))
 
         self.global_step = global_step
-
-
-    def freeze(self, output_path, experiment_id, node_names, global_step):
-
-        models_dir = output_path + '/models/'
-        state = tf.train.get_checkpoint_state(models_dir)
-        path = state.model_checkpoint_path
-        path_arr = path.split('-')
-        assert(len(path_arr) == 2)
-
-        if global_step == -1:
-            input_checkpoint_path = path  # restoring the model from the most recent epoch
-        else:
-            assert(global_step > 0)
-            input_checkpoint_path = path_arr[0] + '-' + str(global_step)  # restoring the model from 'global_step'
-
-        input_graph_path = output_path + '/frozen/' + experiment_id + '_graph_input.pb'
-        tf.train.write_graph(self.sess.graph_def, output_path + '/frozen/', experiment_id + '_graph_input.pb', True)
-        tf.reset_default_graph()
-
-        input_saver_def_path = ""
-        input_binary = False
-
-        print()
-        print('Freezing', input_checkpoint_path)
-        print()
-
-        output_nodes_string = ''
-        for i in range(len(node_names)):
-            if i == (len(node_names) - 1):
-                output_nodes_string = output_nodes_string + node_names[i]
-            else:
-                output_nodes_string = output_nodes_string + node_names[i] + ','
-
-        restore_op_name = "save/restore_all"
-        filename_tensor_name = "save/Const:0"
-        output_graph_path = output_path + '/frozen/' + experiment_id + '_graph_output.pb'
-        clear_devices = True
-        initializer_nodes = ''
-
-        freeze_graph.freeze_graph(
-            input_graph_path,
-            input_saver_def_path,
-            input_binary,
-            input_checkpoint_path,
-            output_nodes_string,
-            restore_op_name,
-            filename_tensor_name,
-            output_graph_path,
-            clear_devices,
-            initializer_nodes)
-        
-
+       
 class coarse_to_fine(Model):
 
     def __init__(self, output_path, clean_output, create_summary, gpu):
         super().__init__(output_path, clean_output, create_summary, gpu)
 
-    def define_model(self, seg_thresh, pred_thresh_mm, dist_thresh_dilate):
-
-        self.internal_shape = np.array([96, 256, 256])
-        self.internal_pixdim = np.array([0.625, 0.5, 0.5])
-        self.voxel_count = self.internal_shape[0] * self.internal_shape[1] * self.internal_shape[2]
-        self.voxel_cubic_mm = self.internal_pixdim[0] * self.internal_pixdim[1] * self.internal_pixdim[2]
-        self.image_cubic_mm = self.voxel_count * self.voxel_cubic_mm
-        self.max_image_val = 1000
-        self.seg_thresh = seg_thresh
-        self.pred_thresh_mm = pred_thresh_mm
-        self.dist_thresh_dilate = dist_thresh_dilate  # Not used (should be verified manually)
-
-        with tf.variable_scope('Input'):
-
-            self.image = tf.placeholder(tf.float32, shape=(None, None, None, None), name='image')
-            self.clot_mask = tf.placeholder(tf.float32, shape=(None, None, None, None), name='clot_mask')
-            self.vessel_mask_trans = tf.placeholder(tf.float32, shape=(None, None, None, None), name='vessel_mask_trans')
-            #self.labels = tf.placeholder(tf.float32, shape=(None), name='labels')
-
-            self.trans_mat = tf.placeholder(tf.float32, shape=(None, 3, 4), name='trans_mat')  # [batch, 3, 4]
-            self.training = tf.placeholder(tf.bool, name='training')
-
-        with tf.variable_scope('Preprocessing'):
-
-            self.batch = tf.shape(self.image)[0]
-
-            # image and label to be transformed has to 5 ranked
-            self.image_trans = tf.placeholder(tf.float32, shape=(None, None, None, None), name='image')
-            self.image_trans = stn3d.spatial_transformer_network(
-                #self.image,
-                tf.expand_dims(self.image, -1),
-                self.trans_mat,
-                self.internal_shape,
-                'trilinear')
-
-            self.clot_mask_trans = stn3d.spatial_transformer_network(
-                tf.expand_dims(self.clot_mask, -1),
-                self.trans_mat,
-                self.internal_shape,
-                'nearest')[:, :, :, :, 0]
-
-            self.image_norm = tf.clip_by_value(self.image_trans, 0, self.max_image_val) / self.max_image_val
-        
-        #tf.Print(tf.shape(self.image_trans), [tf.shape(self.image_trans)], message="Transformed input image shape: ", summarize=80)
         with tf.variable_scope('classifier'): 
             
             self.image_test = tf.stack([tf.squeeze(self.image_norm, -1), tf.squeeze(self.image_norm, -1)], axis=-1)
-
-            logging.critical(f"Model input rank:{len(self.image_test.get_shape())}")
 
             assert len(self.image_test.get_shape()) == 5
             self.logits, self.deep_outputs = self.c2f_unet(self.image_test)
